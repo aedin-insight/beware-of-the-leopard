@@ -8,7 +8,7 @@ import urllib.error
 import urllib.request
 
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_MODEL = "google/gemma-4-31b-it:free"
+DEFAULT_MODEL = "nvidia/nemotron-3.5-lightning:free"
 TIMEOUT_SECONDS = 60
 
 
@@ -91,7 +91,8 @@ def main():
     try:
         stream(prompt, args.model, key)
     except urllib.error.HTTPError as e:
-        fail(f"OpenRouter returned HTTP {e.code}: {api_error(e.read().decode('utf-8', 'replace'))}")
+        hint = " (free models are often rate-limited; retry or try another with --model)" if e.code == 429 else ""
+        fail(f"OpenRouter returned HTTP {e.code}: {api_error(e.read().decode('utf-8', 'replace'))}{hint}")
     except urllib.error.URLError as e:
         fail(f"could not reach OpenRouter: {e.reason}")
     except TimeoutError:
@@ -102,7 +103,8 @@ def main():
         print(file=sys.stderr)
         sys.exit(130)
     except BrokenPipeError:
-        sys.stderr.close()  # e.g. `ask ... | head`; exit quietly
+        # e.g. `ask ... | head`: stop quietly (per Python's SIGPIPE docs)
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         sys.exit(1)
 
 
