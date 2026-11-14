@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""
+ask — Send a prompt to a language model via OpenRouter and stream the reply.
+
+Function:
+    Single-file CLI, standard library only. Reads prompt from argv or stdin,
+    POSTs to OpenRouter with stream=true, and streams delta.content to stdout.
+    Includes a fallback list of free models to handle deprecated/retired models.
+    All errors go to stderr. Exit codes: 0 success, 1 runtime, 2 usage, 130 Ctrl-C.
+
+Secrets:
+    Key is read ONLY from OPENROUTER_API_KEY. No flag, never printed, logged,
+    or included in errors.
+"""
+
+import sys
+import os
+import json
+import argparse
+import urllib.request
+import urllib.error
+
+# A list of known good free models. If the first fails, try the next.
+FALLBACK_MODELS = [
+    "openrouter/free",
+    "meta-llama/llama-3.1-8b-instruct:free",
+    "mistralai/mistral-7b-instruct:free",
+    "google/gemma-2-9b-it:free",
+]
+
+API_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        prog="ask",
+        description="Send a prompt to a language model via OpenRouter and stream the reply.",
+    )
+    parser.add_argument("prompt", nargs="?", help="The prompt. If omitted, reads from stdin.")
+    parser.add_argument("--model", default=None, help="OpenRouter model ID. Defaults to fallback list.")
+    return parser.parse_args()
+
+def get_prompt(args):
+    if args.prompt is not None:
+        prompt = args.prompt
+    elif not sys.stdin.isatty():
+        prompt = sys.stdin.read()
+    else:
+        prompt = ""
+    prompt = prompt.strip()
+    if not prompt:
+        print("usage: ask [--model MODEL] PROMPT", file=sys.stderr)
+        print("       echo PROMPT | ask [--model MODEL]", file=sys.stderr)
+        sys.exit(2)
+    return prompt
+
+def main():
+    args = parse_args()
+    prompt = get_prompt(args)
+
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        print("OPENROUTER_API_KEY is not set", file=sys.stderr)
+        sys.exit(1)
+
+    # Build the list of models to try: User's choice first, then fallbacks.
+    models_to_try = []
+    if args.model:
+        models_to_try.append(args.model)
+    for m in FALLBACK_MODELS:
+        if m not in models_to_try:
+            models_to_try.append(m)
+
+    for model in models_to_try:
+        print(f"Attempting model: {model}", file=sys.stderr)
+        
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": True,
+        }
+
+        req = urllib.request.Request(
+            API_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+
+        in_stream = False
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                    if not line or line.startswith(":") or not line.startswith("data:"):
+                        continue
+                    data = line[len("data:"):].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    
+                    if "error" in chunk:
+                        err = chunk["error"].get("message", str(chunk["error"]))
+                        if not in_stream:
+                            print(f"\nstream error on {model}: {err}", file=sys.stderr)
+                            break # break inner loop, try next model
+                        else:
+                            print(f"\nstream error mid-way: {err}", file=sys.stderr)
+                            sys.exit(1)
+                            
+                    choices = chunk.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta") or {}
+                    content = delta.get("content")
+                    if content:
+                        in_stream = True
+                        sys.stdout.write(content)
+                        sys.stdout.flush()
+                        
+            if in_stream:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return 0
+            else:
+                print(f"No content from {model}, trying next.", file=sys.stderr)
+                continue
+
+        except urllib.error.HTTPError as e:
+            code = e.code
+            if code == 401:
+                print("authentication failed (401)", file=sys.stderr)
+                sys.exit(1)
+            elif code in (400, 404):
+                print(f"model not found: {model}", file=sys.stderr)
+                continue
+            elif code == 429:
+                print(f"rate limited on {model} (429), trying next...", file=sys.stderr)
+                continue
+            else:
+                print(f"HTTP error {code} on {model}", file=sys.stderr)
+                continue
+                
+        except urllib.error.URLError as e:
+            print(f"network error: {e.reason}", file=sys.stderr)
+            sys.exit(1)
+            
+        except Exception as e:
+            if in_stream:
+                print(f"\nstream error mid-way: {e}", file=sys.stderr)
+                sys.exit(1)
+            print(f"stream error on {model}: {e}", file=sys.stderr)
+            continue
+
+    print("\nAll models failed. Check your network or API key.", file=sys.stderr)
+    sys.exit(1)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
